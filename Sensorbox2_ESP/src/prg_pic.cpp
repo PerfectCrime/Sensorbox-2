@@ -1,7 +1,7 @@
 #include <Arduino.h>
 
 #include "main.h"
-#include "network.h"
+#include "network_common.h"
 #include "utils.h"
 #include "FS.h"
 

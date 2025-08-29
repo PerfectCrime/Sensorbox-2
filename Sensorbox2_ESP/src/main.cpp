@@ -54,7 +54,7 @@
 #include <SPIFFS.h>
 
 #include <WiFi.h>
-#include "network.h"
+#include "network_common.h"
 
 #include <esp_task_wdt.h>
 
