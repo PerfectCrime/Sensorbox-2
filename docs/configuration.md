@@ -7,31 +7,37 @@
   - we are in the first 180 seconds after startup of the device; after this period the device assumes you don't want to configure WIFI
 
 * If the above conditions are met, you can configure the WIFI as follows:
-  - connect your smartphone to the wifi network you want your Sensorbox connected to
-  - download and run the ESPTouch app from your favourite appstore
-.   [Android](https://play.google.com/store/apps/details?id=com.fyent.esptouch.android&hl=en_US:)
-.   (please ignore the strange Author name) or
-.   [Apple](https://apps.apple.com/us/app/espressif-esptouch/id1071176700) or
-.   [Github](https://github.com/EspressifApp/EsptouchForAndroid) (for source code).
-  - choose EspTouch V2,
-  - fill in the password of the wifi network,
-  - fill in "1" in device count for provisioning,
-  - fill in "0123456789abcdef" in the AES Key field
-  - leave Custom Data empty
-  - press "Confirm", within 30 seconds the app will confirm a MAC address and an IP address
-  You are connected now. If you want special stuff (static IP address, special DNS address),
-  configure them on your AP/router.
+  - firmware version v2.1.2 or newer:
+    - on your smartphone, turn your wifi off and on so it starts scanning for new wifi networks
+    - connect to AP "Sensorbox-config"
+    - browse to http://192.168.4.1, and fill in the ssid and password of your wifi network
+    You are connected now. If you want special stuff (static IP address, special DNS address),
+    configure them on your AP/router.
+  - firmware version v2.1.1 or older:
+    - connect your smartphone to the wifi network you want your Sensorbox connected to
+    - download and run the ESPTouch app from your favourite appstore
+    .   [Android](https://play.google.com/store/apps/details?id=com.fyent.esptouch.android&hl=en_US:)
+    .   (please ignore the strange Author name) or
+    .   [Apple](https://apps.apple.com/us/app/espressif-esptouch/id1071176700) or
+    .   [Github](https://github.com/EspressifApp/EsptouchForAndroid) (for source code).
+    - choose EspTouch V2,
+    - fill in the password of the wifi network,
+    - fill in "1" in device count for provisioning,
+    - fill in "0123456789abcdef" in the AES Key field
+    - leave Custom Data empty
+    - press "Confirm", within 30 seconds the app will confirm a MAC address and an IP address
+    * If you don't get it to work with the ESPTouch app, there is
+      a backup procedure:
+      - make your Sensorbox powerless, so it will be off
+      - connect your Sensorbox with a USB cable to your PC; it will feed through your USB port now
+      - install the USB driver (Windows) or not (linux) for ESP32 chipset
+      - connect your favorite serial terminal to the appropriate port
+      - unplug and replug the USB cable so the device is freshly started and enters the 180 seconds WIFI configuration period
+      - press enter on your serial terminal; you will be prompted for your WiFi network name and password.
+    You are connected now. If you want special stuff (static IP address, special DNS address),
+    configure them on your AP/router.
 
-* If you don't get it to work with the ESPTouch app, there is
-  a backup procedure:
-  - make your Sensorbox powerless, so it will be off
-  - connect your Sensorbox with a USB cable to your PC; it will feed through your USB port now
-  - install the USB driver (Windows) or not (linux) for ESP32 chipset
-  - connect your favorite serial terminal to the appropriate port
-  - unplug and replug the USB cable so the device is freshly started and enters the 180 seconds WIFI configuration period
-  - press enter on your serial terminal; you will be prompted for your WiFi network name and password.
 
- 
 # Webserver
 After configuration of your Wifi parameters, your Sensorbox will present itself on your LAN via a webserver. This webserver can be accessed through:
 * http://ip-address/

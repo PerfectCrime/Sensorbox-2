@@ -1,3 +1,5 @@
+#if defined(ESP32)
+
 #include <WiFi.h>
 #include "mbedtls/md_internal.h"
 #include "utils.h"
@@ -7,9 +9,13 @@
 #include <ESPmDNS.h>
 #include <Update.h>
 #include <Preferences.h>
+#include "esp_efuse.h"
 
-#include "main.h"
-#if SMARTEVSE_VERSION == 3
+#ifndef SENSORBOX_VERSION
+#include "esp32.h"
+#endif
+
+#if SMARTEVSE_VERSION >=30
 #include "OneWire.h"
 #endif
 
@@ -29,6 +35,7 @@ struct mg_mgr mgr;  // Mongoose event manager. Holds all connections
 // end of mongoose stuff
 
 String APhostname = "SmartEVSE-" + String( MacId() & 0xffff, 10);           // SmartEVSE access point Name = SmartEVSE-xxxxx
+String APpassword = "00000000";
 
 #if MQTT
 // MQTT connection info
@@ -58,105 +65,11 @@ uint32_t serialnr;
 
 // The following data will be updated by eeprom/storage data at powerup:
 uint8_t WIFImode = WIFI_MODE;                                               // WiFi Mode (0:Disabled / 1:Enabled / 2:Start Portal)
-char SmartConfigKey[] = "0123456789abcdef";                                 // SmartConfig / EspTouch AES key, used to encyrypt the WiFi password.
 String TZinfo = "";                                                         // contains POSIX time string
 
 char *downloadUrl = NULL;
 int downloadProgress = 0;
 int downloadSize = 0;
-
-bool isValidInput(String input) {
-  // Check if the input contains only alphanumeric characters, underscores, and hyphens
-  for (char c : input) {
-    if (!isalnum(c) && c != '_' && c != '-') {
-      return false;
-    }
-  }
-  return true;
-}
-
-static uint8_t CliState = 0;
-#ifdef SENSORBOX_VERSION
-void ProvisionCli(HardwareSerial &s) {
-//void ProvisionCli(HardwareSerial &s = &Serial) {
-#else
-#if SMARTEVSE_VERSION == 3
-void ProvisionCli(void) {
-    HardwareSerial &s = Serial;
-#else
-void ProvisionCli(HWCDC &s = Serial) {
-#endif
-#endif
-    // SSID and PW for your Router
-    static String Router_SSID, Router_Pass;
-    static char CliBuffer[64];
-    static uint8_t idx = 0;
-    static bool entered = false;
-    char ch;
-
-    if (CliState == 0) {
-        s.println("Enter WiFi access point name:");
-        CliState++;
-
-    } else if (CliState == 1 && entered) {
-        Router_SSID = String(CliBuffer);
-        Router_SSID.trim();
-        if (!isValidInput(Router_SSID)) {
-            s.println("Invalid characters in SSID.");
-            Router_SSID = "";
-            CliState = 0;
-        } else CliState++;              // All OK, now request password.
-        idx = 0;
-        entered = false;
-
-    } else if (CliState == 2) {
-        s.println("Enter WiFi password:");
-        CliState++;
-
-    } else if (CliState == 3 && entered) {
-        Router_Pass = String(CliBuffer);
-        Router_Pass.trim();
-        if (idx < 8) {
-            s.println("Password should be min 8 characters.");
-            Router_Pass = "";
-            CliState = 2;
-        } else CliState++;             // All OK
-        idx = 0;
-        entered = false;
-
-    } else if (CliState == 4) {
-        s.println("WiFi credentials stored.");
-        WiFi.mode(WIFI_STA);                // Set Station Mode
-        WiFi.begin(Router_SSID, Router_Pass);   // Configure Wifi with credentials
-        CliState++;
-    }
-
-
-    // read input, and store in buffer until we read a \n
-    while (s.available()) {
-        ch = s.read();
-
-        // When entering a password, replace last character with a *
-        if (CliState == 3 && idx) s.printf("\b*");
-        s.print(ch);
-
-        // check for CR/LF, and make sure the contents of the buffer is atleast 1 character
-        if (ch == '\n' || ch == '\r') {
-            if (idx) {
-                CliBuffer[idx] = 0;         // null terminate
-                entered = true;
-            } else if (CliState == 1 || CliState == 3) CliState--; // Reprint the last message
-        } else if (idx < 63) {              // Store in buffer
-            if (ch == '\b' && idx) {
-                idx--;
-                s.print(" \b");        // erase character from terminal
-            } else {
-                CliBuffer[idx++] = ch;
-            }
-        }
-    }
-}
-
 
 #if MQTT
 #if MQTT_ESP == 1
@@ -627,7 +540,7 @@ void FirmwareUpdate(void *parameter) {
     //_LOG_A("DINGO: url=%s.\n", downloadUrl);
     if (forceUpdate(downloadUrl, 1)) {
 #ifndef SENSORBOX_VERSION
-        _LOG_A("Firmware update succesfull; rebooting as soon as no EV is connected.\n");
+        _LOG_A("Firmware update succesfull; rebooting as soon as no EV is charging.\n");
 #else
         _LOG_A("Firmware update succesfull; rebooting.\n");
 #endif
@@ -748,18 +661,161 @@ void setTimeZone(void * parameter) {
     vTaskDelete(NULL);                                                          //end this task so it will not take up resources
 }
 
+#ifndef SENSORBOX_VERSION
+String homeWizardHost;
+HTTPClient* homeWizardHttpClient=nullptr;
+bool homeWizardHttpClientInitialized = false;
+
+/**
+ * @brief Discovers a HomeWizard P1 meter service on the local network.
+ *
+ * This function uses mDNS to search for services advertising "_hwenergy._tcp" on the local network.
+ *
+ * @return A string containing the hostname and port of the first matching HomeWizard P1 meter service
+ * or an empty string in case no HomeWizard P1 meter is found in the local network
+ */
+String discoverHomeWizardP1() {
+
+    // If there's a cached result, return it immediately
+    if (!homeWizardHost.isEmpty()) {
+        _LOG_A("discoverHWP1(): Using cached host '%s'.\n", homeWizardHost.c_str());
+        return homeWizardHost;
+    }
+
+    // Search for _hwenergy._tcp services.
+    // https://api-documentation.homewizard.com/docs/discovery/
+    const int n = MDNS.queryService("hwenergy", "tcp");
+    if (n < 0) {
+        _LOG_A("discoverHWP1(): MDNS query failed.\n");
+    } else if (n == 0) {
+        _LOG_A("discoverHWP1(): No MDNS services found.\n");
+    } else {
+        for (int i = 0; i < n; i++) {
+            String hostname = MDNS.hostname(i);
+            if (hostname.startsWith("p1meter-")) {
+                const uint16_t port = MDNS.port(i);
+                _LOG_A("discoverHWP1(): Found HWP1 service: %s.local (%s:%d)\n", hostname.c_str(),
+                       MDNS.IP(i).toString().c_str(), port);
+
+                // Return first match.
+                // Cache the result before returning it
+                homeWizardHost = hostname + ".local" + (port != 80 ? ":" + String(port) : "");
+                return homeWizardHost;
+            }
+        }
+        _LOG_A("discoverHWP1(): No matching HWP1 service found.\n");
+    }
+    return "";
+}
+
+/**
+ * @brief Retrieves active current values from a HomeWizard P1 meter API.
+ *
+ * This function sends an HTTP GET request to the specified URL to fetch the active current data
+ * in JSON format, parses the JSON response, and retrieves specific fields for current.
+ *
+ * @return A pair containing:
+ *     - A int flag indicating: 0: failure, 1: single phase current, 3: 3 phase current
+ *     - An array of 3 values representing the active current in deci-amps for L1, L2, and L3
+ */
+std::pair<int8_t, std::array<std::int16_t, 3> > getMainsFromHomeWizardP1() {
+
+    _LOG_A("getMainsFromHWP1(): invocation\n");
+    const String hostname = discoverHomeWizardP1();
+    if (hostname == "") {
+        return {false, {0, 0, 0}};
+    }
+
+    const String url = "http://" + hostname + "/api/v1/data";
+    _LOG_A("getMainsFromHWP1(): connect to URL %s\n", url.c_str());
+
+
+    if (!homeWizardHttpClientInitialized) {
+        homeWizardHttpClient = new HTTPClient();
+        homeWizardHttpClient->setTimeout(1500);
+        homeWizardHttpClient->addHeader("User-Agent", "SmartEVSE-v3");
+        homeWizardHttpClient->addHeader("Accept", "application/json");
+        homeWizardHttpClientInitialized = true;
+    }
+
+    homeWizardHttpClient->begin(url);
+
+    // Handle HTTP errors or timeout.
+    const int httpCode = homeWizardHttpClient->GET();
+    if (httpCode != HTTP_CODE_OK) {
+        _LOG_A("getMainsFromHWP1(): Error on HTTP request (httpCode=%i), url=%s.\n", httpCode, url.c_str());
+        homeWizardHttpClient->end(); // Always cleanup
+        delete homeWizardHttpClient;
+        homeWizardHttpClient = nullptr;
+        homeWizardHttpClientInitialized = false;
+        return {false, {0, 0, 0}};
+    }
+
+    // Get the response stream
+    WiFiClient *stream = homeWizardHttpClient->getStreamPtr();
+
+    const char* currentKeys[] = {"active_current_l1_a", "active_current_l2_a", "active_current_l3_a"};
+    const char* powerKeys[] = {"active_power_l1_w", "active_power_l2_w", "active_power_l3_w"};
+
+    // Create a filter to parse only specific fields.
+    StaticJsonDocument<96> filter;
+    for (const auto* key : currentKeys) filter[key] = true;
+    for (const auto* key : powerKeys) filter[key] = true;
+
+    /////test homewizard connected to single phase mainsmeter
+    //const char stream[] = "{\"wifi_ssid\":\"Imaginous\",\"wifi_strength\":86,\"smr_version\":50,\"meter_model\":\"Kaifa AIFA-METER\",\"unique_id\":\"0000000000000000000000000000000000\",\"active_tariff\":1,\"total_power_import_kwh\":7412.085,\"total_power_import_t1_kwh\":4283.482,\"total_power_import_t2_kwh\":3128.603,\"total_power_export_kwh\":6551.330,\"total_power_export_t1_kwh\":1930.678,\"total_power_export_t2_kwh\":4620.652,\"active_power_w\":-2725.000,\"active_power_l1_w\":-2725.000,\"active_voltage_l1_v\":238.400,\"active_current_a\":11.430,\"active_current_l1_a\":-11.430,\"voltage_sag_l1_count\":8.000,\"voltage_swell_l1_count\":0.000,\"any_power_fail_count\":0.000,\"long_power_fail_count\":0.000,\"total_gas_m3\":1795.627,\"gas_timestamp\":250405135009,\"gas_unique_id\":\"0000000000000000000000000000000000\",\"external\":[{\"unique_id\":\"0000000000000000000000000000000000\",\"type\":\"gas_meter\",\"timestamp\":250405135009,\"value\":1795.627,\"unit\":\"m3\"}]}";
+
+    // Create a filtered JSON document to hold the parsed data.
+    DynamicJsonDocument doc(256);
+    const DeserializationError error = deserializeJson(doc, *stream, DeserializationOption::Filter(filter));
+    homeWizardHttpClient->end();
+
+    // Handle JSON parsing errors.
+    if (error) {
+        _LOG_A("getMainsFromHomeWizardP1(): JSON deserialization failed: %s\n", error.c_str());
+        return {false, {0, 0, 0}};
+    }
+
+    uint8_t phases = 0;
+    // Verify all required keys exist.
+    for (const auto* key : currentKeys) {
+        if (doc.containsKey(key))
+            phases++;
+    }
+
+    if (!phases) {
+        // Early return on missing data.
+        _LOG_A("getMainsFromHomeWizardP1(): required JSON fields 'active_current_l1_a' not found\n");
+        return {phases, {0, 0, 0}};
+    }
+
+    // Determine grid direction based on power: negative indicates feed-in, positive indicates usage.
+    auto getCorrection = [&doc](const char* powerKey) -> int8_t {
+        return doc[powerKey].as<int>() < 0 ? -1 : 1;
+    };
+
+    // Process all three phases.
+    std::array<int16_t, 3> currents;
+    for (size_t i = 0; i < phases; ++i) {
+        int16_t rawCurrent = doc[currentKeys[i]].as<float>() * 10;
+        currents[i] = std::abs(rawCurrent) * getCorrection(powerKeys[i]);
+    }
+return {phases, currents};
+}
+#endif
+
 
 void webServerRequest::setMessage(struct mg_http_message *hm) {
     hm_internal = hm;
 }
 
 bool webServerRequest::hasParam(const char *param) {
-    return (mg_http_get_var(&hm_internal->query, param, temp, sizeof(temp)) > 0);
+    return (mg_http_get_var(&hm_internal->query, param, temp, sizeof(temp)) >= 0);
 }
 
 webServerRequest* webServerRequest::getParam(const char *param) {
     _value = ""; // Clear previous value
-    if (mg_http_get_var(&hm_internal->query, param, temp, sizeof(temp)) > 0) {
+    if (mg_http_get_var(&hm_internal->query, param, temp, sizeof(temp)) >= 0) {
         _value = temp;
     }
     return this; // Return pointer to self
@@ -833,6 +889,26 @@ static void timer_fn(void *arg) {
 }
 #endif
 
+
+// HTML web form for entering WIFI credentials in AP setup portal
+static const char *html_form = R"EOF(
+<!DOCTYPE html><html><head><title>WiFi Setup</title>
+<script>
+function togglePassword(){
+  var x = document.getElementById('password');
+  x.type = x.type === 'password' ? 'text' : 'password';
+}
+</script></head><body>
+<h2>WiFi Configuration</h2>
+<form action="/save" method="POST">
+SSID:<br><input type="text" name="ssid"><br>
+Password:<br><input type="password" name="password" id="password"><br>
+<input type="checkbox" onclick="togglePassword()"> Show Password<br><br>
+<input type="submit" value="Save">
+</form></body></html>
+)EOF";
+
+
 // Connection event handler function
 // indenting lower level two spaces to stay compatible with old StartWebServer
 // We use the same event handler function for HTTP and HTTPS connections
@@ -869,6 +945,29 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
             }
             shouldReboot = true;
             mg_http_reply(c, 200, "Content-Type: text/plain\r\n", "Erasing settings, rebooting");
+        } else if (mg_http_match_uri(hm, "/") && WIFImode == 2) { // serve AP page to fill in WIFI credentials
+            mg_http_reply(c, 200, "Content-Type: text/html\r\n", "%s", html_form);
+        } else if (mg_http_match_uri(hm, "/save")) {
+            char ssid[64], password[64];
+            bool has_ssid = mg_http_get_var(&hm->body, "ssid", ssid, sizeof(ssid)) > 0;
+            bool has_pass = mg_http_get_var(&hm->body, "password", password, sizeof(password)) > 0;
+            if (has_ssid && has_pass) {
+                mg_http_reply(c, 200, "Content-Type: text/html\r\n", "<html><body><h2>Saved! Rebooting...</h2></body></html>");
+#ifndef SENSORBOX_VERSION
+                vTaskDelay(2000 / portTICK_PERIOD_MS);                          // for some strange reason this triggers the watchdog function in Sensorbox
+#endif
+                _LOG_A("Connecting to wifi network.\n");
+                WiFi.mode(WIFI_STA);                // Set Station Mode
+                WiFi.begin(ssid, password);   // Configure Wifi with credentials
+                WIFImode = 1;                                                           // we are already connected so don't call handleWIFImode
+                write_settings();
+#ifndef SENSORBOX_VERSION
+                vTaskDelay(2000 / portTICK_PERIOD_MS);                          // for some strange reason this triggers the watchdog function in Sensorbox
+#endif
+                ESP.restart();
+            } else {
+              mg_http_reply(c, 400, "", "Missing SSID or password");
+            }
         } else if (mg_http_match_uri(hm, "/autoupdate")) {
             char owner[40];
             char buf[8];
@@ -922,11 +1021,13 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
                     if(!offset) {
                         _LOG_A("Update Start: %s\n", file);
                         if(!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000), U_FLASH) {
-                                Update.printError(Serial);
+                            _LOG_A("ERROR: Update has error:%s.\n", Update.errorString());
+                            Update.printError(Serial);
                         }
                     }
                     if(!Update.hasError()) {
                         if(Update.write((uint8_t*) hm->body.buf, hm->body.len) != hm->body.len) {
+                            _LOG_A("ERROR: Update has error:%s.\n", Update.errorString());
                             Update.printError(Serial);
                         } else {
                             _LOG_A("bytes written %lu\r", offset + hm->body.len);
@@ -938,6 +1039,7 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
                             delay(1000);
                             ESP.restart();
                         } else {
+                            _LOG_A("ERROR: Update has error:%s.\n", Update.errorString());
                             Update.printError(Serial);
                         }
                     }
@@ -953,11 +1055,13 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
                         _LOG_A("Firmware signature:");
                         dump(signature);
                         if(!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000), U_FLASH) {
-                                Update.printError(Serial);
+                            _LOG_A("ERROR: Update has error:%s.\n", Update.errorString());
+                            Update.printError(Serial);
                         }
                     }
                     if(!Update.hasError()) {
                         if(Update.write((uint8_t*) hm->body.buf, hm->body.len) != hm->body.len) {
+                            _LOG_A("ERROR: Update has error:%s.\n", Update.errorString());
                             Update.printError(Serial);
                             FREE(signature);
                         } else {
@@ -989,7 +1093,7 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
                             }
                         }
                         if (!verification_result) {
-                            _LOG_A("Update failed!\n");
+                            _LOG_A("Update failed! ERROR:%s.\n", Update.errorString());
                             Update.printError(Serial);
                             //Update.abort(); //not sure this does anything in this stage
                             //Update.rollBack();
@@ -1001,7 +1105,7 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
                         FREE(signature);
                     }
                 } else //end of firmware.signed.bin
-#if SMARTEVSE_VERSION == 3  //TODO make this work for v4 too!
+#if SMARTEVSE_VERSION >=30
                 if (!memcmp(file,"rfid.txt", sizeof("rfid.txt"))) {
                     if (offset != 0) {
                         mg_http_reply(c, 400, "", "rfid.txt too big, only 100 rfid's allowed!");
@@ -1021,7 +1125,7 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
                             if (c == '\n' || pos == hm->body.len) {
                                 strncpy(RFIDtxtstring, hm->body.buf + beginpos, 19);         // in case of DOS the 0x0D is stripped off here
                                 RFIDtxtstring[19] = '\0';
-                                r = sscanf(RFIDtxtstring,"%02X%02x%02x%02x%02x%02x%02x", &RFID_UID[0], &RFID_UID[1], &RFID_UID[2], &RFID_UID[3], &RFID_UID[4], &RFID_UID[5], &RFID_UID[6]);
+                                r = sscanf(RFIDtxtstring,"%02x%02x%02x%02x%02x%02x%02x", &RFID_UID[0], &RFID_UID[1], &RFID_UID[2], &RFID_UID[3], &RFID_UID[4], &RFID_UID[5], &RFID_UID[6]);
                                 RFID_UID[7]=crc8((unsigned char *) RFID_UID,7);
                                 if (r == 7) {
                                     _LOG_A("Store RFID_UID %02x%02x%02x%02x%02x%02x%02x, crc=%02x.\n", RFID_UID[0], RFID_UID[1], RFID_UID[2], RFID_UID[3], RFID_UID[4], RFID_UID[5], RFID_UID[6], RFID_UID[7]);
@@ -1051,7 +1155,11 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
             }
         } else if (mg_http_match_uri(hm, "/reboot")) {
             shouldReboot = true;
-            mg_http_reply(c, 200, "", "Rebooting....");
+#ifndef SMARTEVSE_VERSION //sensorbox
+            mg_http_reply(c, 200, "", "Rebooting after 5s....");
+#else
+            mg_http_reply(c, 200, "", "Rebooting 5s after EV stops charging....");
+#endif
         } else if (mg_http_match_uri(hm, "/settings") && !memcmp("POST", hm->method.buf, hm->method.len)) {
             DynamicJsonDocument doc(64);
 #if MQTT
@@ -1112,13 +1220,32 @@ static void fn_http_server(struct mg_connection *c, int ev, void *ev_data) {
             serializeJson(doc, json);
             mg_http_reply(c, 200, "Content-Type: application/json\r\n", "%s\r\n", json.c_str());    // Yes. Respond JSON
         } else {                                                                    // if everything else fails, serve static page
-            struct mg_http_serve_opts opts = {.root_dir = "/data", .ssi_pattern = NULL, .extra_headers = NULL, .mime_types = NULL, .page404 = NULL, .fs = &mg_fs_packed };
-            //opts.fs = NULL;
-            mg_http_serve_dir(c, hm, &opts);
+            // Cache ".webp" or ".ico" image files for one year without revalidation or server checks.
+            if (mg_match(hm->uri, mg_str("#.webp"), NULL) ||
+                mg_match(hm->uri, mg_str("#.ico"), NULL)) {
+                struct mg_http_serve_opts opts = {
+                    .root_dir = "/data", .ssi_pattern = NULL,
+                    .extra_headers = "Cache-Control: public, max-age=31536000\r\n",
+                    .mime_types = NULL, .page404 = NULL, .fs = &mg_fs_packed
+                };
+                mg_http_serve_dir(c, hm, &opts);
+            } else {
+                struct mg_http_serve_opts opts = {.root_dir = "/data", .ssi_pattern = NULL, .extra_headers = NULL, .mime_types = NULL, .page404 = NULL, .fs = &mg_fs_packed };
+                //opts.fs = NULL;
+                mg_http_serve_dir(c, hm, &opts);
+            }
         }
     } // handle_URI
     delete request;
   } //HTTP request received
+}
+
+// turns out getLocalTime only checks if the current year > 2016, and if so, decides NTP must have synced;
+// this callback function actually checks if we are synced!
+void timeSyncCallback(struct timeval *tv)
+{
+    LocalTimeSet = true;
+    _LOG_A("Synced clock to NTP server!");    // somehow adding a \n here hangs the telnet server after printing this message ?!?
 }
 
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -1133,6 +1260,17 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
             static char dns4url[]="udp://123.123.123.123:53";
             sprintf(dns4url, "udp://%s:53", WiFi.dnsIP().toString().c_str());
             mgr.dns4.url = dns4url;
+
+            // Init and get the time
+            // First option to get time from local ntp server blocks the second fallback option since 2021:
+            // See https://github.com/espressif/arduino-esp32/issues/4964
+            //sntp_servermode_dhcp(1);                                                    //try to get the ntp server from dhcp
+
+            // Configure time after WiFi is connected
+            esp_sntp_setservername(1, "europe.pool.ntp.org");
+            sntp_set_time_sync_notification_cb(timeSyncCallback);
+            esp_sntp_init();
+            
             if (TZinfo == "") {
                 xTaskCreate(
                     setTimeZone, // Function that should be called
@@ -1209,97 +1347,35 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   }
 }
 
-// turns out getLocalTime only checks if the current year > 2016, and if so, decides NTP must have synced;
-// this callback function actually checks if we are synced!
-void timeSyncCallback(struct timeval *tv)
-{
-    LocalTimeSet = true;
-    _LOG_A("Synced clock to NTP server!");    // somehow adding a \n here hangs the telnet server after printing this message ?!?
-}
 
-
-void SetupPortalTask(void * parameter) {
-#ifdef SENSORBOX_VERSION
-    HardwareSerial *s1 = *((HardwareSerial **)parameter);
-    HardwareSerial &s = *s1;
-#endif
-    _LOG_A("Start Portal...\n");
-    WiFi.disconnect(true);
-
-    // Close Mongoose HTTP Server
-    if (HttpListener80) {
-        HttpListener80->is_closing = 1;
-    }
-    if (HttpListener443) {
-        HttpListener443->is_closing = 1;
-    }
-
-    while (HttpListener80 || HttpListener443) {
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        _LOG_A("Waiting for Mongoose Server to terminate\n");
-    }
-
-    //Init WiFi as Station, start SmartConfig
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.beginSmartConfig(SC_TYPE_ESPTOUCH_V2, SmartConfigKey);
- 
-    //Wait for SmartConfig packet from mobile.
-    _LOG_V("Waiting for SmartConfig.\n");
-#ifdef SENSORBOX_VERSION
-    s.end();
-    s.begin(115200, SERIAL_8N1, PIN_RXD, PIN_TXD, false);                    // Input from TX of PIC, and debug output to USB
-#endif
-    unsigned long configTimer = millis();
-    while (!WiFi.smartConfigDone() && (WIFImode == 2) && (WiFi.status() != WL_CONNECTED) && millis() - configTimer < 180000) {
-        // Also start Serial CLI for entering AP and password.
-#ifdef SENSORBOX_VERSION
-        ProvisionCli(s);
-#else
-        ProvisionCli();
-#endif
-        delay(100);
-    }                       // loop until connected or Wifi setup menu is exited.
-    delay(2000);            // give smartConfig time to send provision status back to the users phone.
-        
-    if (WiFi.status() == WL_CONNECTED) {
-        _LOG_V("\nWiFi Connected, IP Address:%s.\n", WiFi.localIP().toString().c_str());
-        WIFImode = 1;                                                           // we are already connected so don't call handleWIFImode
-    } else {
-        _LOG_V("\nCould not connect to WiFi, giving up.\n");
-        WIFImode = 0;
-        handleWIFImode();
-    }
-    write_settings();
-    CliState= 0;
-#ifndef SENSORBOX_VERSION                                                       //so we are not on a sensorbox but on a smartevse
-#if SMARTEVSE_VERSION == 3 //TODO enable this when LCD menu in v4 is enabled
-    LCDNav = 0;
-#endif
-#else
-    s.end();
-    if (s == Serial2) {
-        Serial2.setRxBufferSize(2048);                                                // Important! first increase buffer, then setup Uart2
-        Serial2.begin(115200, SERIAL_8N1, PIN_RX, -1, true);
-        Serial.begin(115200, SERIAL_8N1, PIN_PGD, PIN_TXD, false);
-    } else
-        s.begin(115200, SERIAL_8N1, PIN_PGD, PIN_TXD, false);                    // Input from TX of PIC, and debug output to USB
-#endif
-    WiFi.stopSmartConfig(); // this makes sure repeated SmartConfig calls are succesfull
-    vTaskDelete(NULL);                                                          //end this task so it will not take up resources
-}
-
-
-void handleWIFImode(void *s) {
+void handleWIFImode() {
     if (WIFImode == 2 && WiFi.getMode() != WIFI_AP_STA) {
-        //now start the portal in the background, so other tasks keep running
-        xTaskCreate(
-            SetupPortalTask,     // Function that should be called
-            "SetupPortalTask",   // Name of the task (for debugging)
-            10000,                // Stack size (bytes)                              // printf needs atleast 1kb
-            (void *) &s,          // Parameter: which serial interface to use for ProvisionCli
-            3,                    // Task priority - medium
-            NULL                  // Task handleCTReceive
-        );
+        _LOG_A("Start Portal...\n");
+
+#ifndef SENSORBOX_VERSION
+        // set random AP password
+        uint8_t i, c;
+        for (i=0; i<8 ;i++) {
+                c = random(16) + '0';
+                if (c > '9') c += 'a'-'9'-1;
+                APpassword[i] = c;
+        }
+
+        // Start WiFi as AP
+        WiFi.softAP("SmartEVSE-config", APpassword);
+#else
+        APpassword = "0123456789abcdef";
+        WiFi.softAP("Sensorbox-config", APpassword);
+#endif
+        IPAddress IP = WiFi.softAPIP();
+
+        if (!HttpListener80) {
+            HttpListener80 = mg_http_listen(&mgr, "http://0.0.0.0:80", fn_http_server, NULL);  // Setup listener
+        }
+        if (!HttpListener443) {
+            HttpListener443 = mg_http_listen(&mgr, "http://0.0.0.0:443", fn_http_server, (void *) 1);  // Setup listener
+        }
+        _LOG_A("HTTP server started\n");
     }
 
     if (WIFImode == 1 && WiFi.getMode() == WIFI_OFF) {
@@ -1331,6 +1407,18 @@ void WiFiSetup(void) {
 
         _LOG_A("hwversion %04x serialnr:%u \n",hwversion, serialnr);
         //_LOG_A(ec_public);
+
+        // SmartEVSE v3.1 has this also stored in efuses
+        uint8_t efuse_block1[32];
+        uint8_t efuse_hwversion[2];
+        uint8_t efuse_serialnr[3];
+        esp_efuse_read_block(EFUSE_BLK1, efuse_block1, 0, 32*8);
+        esp_efuse_read_block(EFUSE_BLK3, efuse_hwversion, 56, 16);
+        esp_efuse_read_block(EFUSE_BLK3, efuse_serialnr, 72, 24);
+
+        //_LOG_A("Private key: ");
+        //for (uint8_t x=0; x<32; x++) _LOG_A_NO_FUNC("%02x",efuse_block1[x]);
+        //_LOG_A_NO_FUNC(" hwver: %02x%02x serialnr: %u\n", efuse_hwversion[1], efuse_hwversion[0], efuse_serialnr[0]+(efuse_serialnr[1]<<8));
     } else {
         _LOG_A("No KeyStorage found in nvs!\n");
         if (!serialnr) serialnr = MacId() & 0xffff;                             // when serialnr is not programmed (anymore), we use the Mac address
@@ -1345,25 +1433,9 @@ void WiFiSetup(void) {
 
     mg_mgr_init(&mgr);  // Initialise event manager
 
-    WiFi.setAutoReconnect(true);                                                //actually does nothing since this is the default value
+    WiFi.setAutoReconnect(true);                                                // Required for Arduino 3
     //WiFi.persistent(true);
     WiFi.onEvent(onWifiEvent);
-
-    // Init and get the time
-    // First option to get time from local ntp server blocks the second fallback option since 2021:
-    // See https://github.com/espressif/arduino-esp32/issues/4964
-    //sntp_servermode_dhcp(1);                                                    //try to get the ntp server from dhcp
-    sntp_setservername(1, "europe.pool.ntp.org");                               //fallback server
-    sntp_set_time_sync_notification_cb(timeSyncCallback);
-    sntp_init();
-
-    // Set random AES Key for SmartConfig provisioning, first 8 positions are 0
-    // This key is displayed on the LCD, and should be entered when using the EspTouch app.
-#ifndef SENSORBOX_VERSION
-    for (uint8_t i=0; i<8 ;i++) {
-        SmartConfigKey[i+8] = random(9) + '1';
-    }
-#endif
 
     if (preferences.begin("settings", false) ) {
         TZinfo = preferences.getString("TimezoneInfo","");
@@ -1371,7 +1443,7 @@ void WiFiSetup(void) {
             setenv("TZ",TZinfo.c_str(),1);
             tzset();
         }
-#if MQTT == 1
+#if MQTT
         MQTTpassword = preferences.getString("MQTTpassword");
         MQTTuser = preferences.getString("MQTTuser");
 #ifdef SENSORBOX_VERSION
@@ -1387,7 +1459,7 @@ void WiFiSetup(void) {
 
     handleWIFImode();                                                           //go into the mode that was saved in nonvolatile memory
 
-#if MQTT ==1 && MQTT_ESP == 1
+#if MQTT && MQTT_ESP
     MQTTclient.connect();
 #endif
 
@@ -1422,3 +1494,4 @@ void network_loop() {
     Debug.handle();
 #endif
 }
+#endif

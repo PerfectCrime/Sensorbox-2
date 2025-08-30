@@ -25,6 +25,7 @@
 
 #define __EVSE_NETWORK
 
+#include "main.h" //so SENSORBOX_VERSION is read in Sensorbox
 #include "mongoose.h"
 #include <ArduinoJson.h>
 
@@ -72,7 +73,7 @@ public:
     void disconnect(void) { mg_mqtt_disconnect(s_conn, &default_opts); };
 #else
     void connect(void);
-    void disconnect(void) { esp_mqtt_client_stop(client); };
+    void disconnect(void) { esp_mqtt_client_stop(client); connected = false; }; //we have to set connected because for some reason MQTT_EVENT_DISCONNECTED is not happening
 #endif
     void publish(const String &topic, const int32_t &payload, bool retained, int qos) { publish(topic, String(payload), retained, qos); };
     void publish(const String &topic, const String &payload, bool retained, int qos);
@@ -114,8 +115,12 @@ extern char *downloadUrl;
 extern uint32_t serialnr;
 extern void RunFirmwareUpdate(void);
 extern void WiFiSetup(void);
-extern void handleWIFImode(void *s = &Serial);
+extern void handleWIFImode(void);
 extern bool getLatestVersion(String owner_repo, String asset_name, char *version);
+#ifndef SENSORBOX_VERSION
+extern std::pair<int8_t, std::array<std::int16_t, 3>> getMainsFromHomeWizardP1();
+extern String homeWizardHost;
+#endif
 
 #define FW_DOWNLOAD_PATH "http://smartevse-3.s3.eu-west-2.amazonaws.com"
 

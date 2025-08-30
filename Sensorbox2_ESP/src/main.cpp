@@ -541,13 +541,13 @@ void P1Task(void * parameter) {
         // and we are not in the first 5 seconds of startup (to give the existing wifi time to connect and P1 data to be entered)
         // and we are not already in wifimode 2
         // and we are not later then the first 180s after startup; perhaps we are not interested in having a wifi connection?
-        // we go to wifimode 2 smartconfig
+        // we go to wifimode 2
         WIFImode = 2;
         if (lockedToP1) {
-            handleWIFImode(&Serial);                                             // P1 data comes in so Serial0 is available
+            handleWIFImode();                                                   // P1 data comes in so Serial0 is available
             blockCT = true;
         } else {
-            handleWIFImode(&Serial2);
+            handleWIFImode();
             blockP1 = true;
         }
     }
