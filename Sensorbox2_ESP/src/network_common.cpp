@@ -169,6 +169,7 @@ void MQTTclient_t::announce(const String& entity_name, const String& domain, con
     String payload = "{"
         + jsn("name", entity_name)
         + jsna("object_id", String(MQTTprefix + "-" + entity_suffix))
+        + jsna("default_entity_id", String(MQTTprefix + "-" + entity_suffix))
         + jsna("unique_id", String(MQTTprefix + "-" + entity_suffix))
         + jsna("state_topic", String(MQTTprefix + "/" + entity_suffix))
         + jsna("availability_topic", String(MQTTprefix + "/connected"))

@@ -930,6 +930,7 @@ void SetupMQTTClient() {
      "{" \
         + jsn("name", entity_name) \
         + jsna("object_id", entity_id) \
+        + jsna("default_entity_id", entity_id) \
         + jsna("unique_id", entity_id) \
         + jsna("state_topic", entity_path) \
         + jsna("availability_topic",String(MQTTprefix+"/connected")) \
