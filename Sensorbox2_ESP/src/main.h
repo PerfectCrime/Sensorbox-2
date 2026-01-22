@@ -1,8 +1,9 @@
 
 #define SENSORBOX_VERSION 20                                                    // 2 LSB should be 0, as these are WIRE settings
-#define SENSORBOX_SWVER 2                                                       // 0 = Original software
+#define SENSORBOX_SWVER 3                                                       // 0 = Original software
                                                                                 // 1 = Supports extra modbus registers (Time, IP, Hostname etc)       
-                                                                                // 2 = Software version 2.1.0
+                                                                                // 2 = Software version 2.1.0 - 2.1.2
+                                                                                // 3 = Software version 2.1.3
 #define WDT_TIMEOUT 3                                                           // 3 seconds WDT timeout
 
 #define PIN_LED_GREEN 32
@@ -35,6 +36,8 @@
 #define WIFI_MODE 0                                                             // WiFi disabled
 #define AP_PASSWORD "00000000"                                                  // Will be overwritten by random 8 char password.
 
+#define PORTAL_TIMEOUT 180                                                      // Time in seconds the portal is active
+#define MODBUS_LED_TIMEOUT 2500                                                 // 2.5 seconds timeout for Modbus LED control 
 #include "debug.h"
 
 // Toggle pins of the RS485 transceiver.

@@ -50,8 +50,8 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
-
-#include <SPIFFS.h>
+#include <FS.h>
+#include <LittleFS.h>
 
 #include <WiFi.h>
 #include "network_common.h"
@@ -95,8 +95,15 @@ extern uint8_t WIFImode;
 String SmartEVSEHost = "";
 
 unsigned long ModbusTimer=0;
+unsigned long ModbusLedTimer=0;  // Track last Modbus LED update
 unsigned char dataready=0, datareadyAPI=0, CTcount, DSMRver, IrmsMode = 0;
 unsigned char LedCnt, LedState, LedSeq[4] = {0,0,0,0};
+float EnergyTariff1 = 0, EnergyTariff2 = 0;
+float EnergyReturnTariff1 = 0, EnergyReturnTariff2 = 0;
+float Power[3] = {0,0,0};
+float PowerReturn[3] = {0,0,0};
+float TotalPower = 0, TotalPowerReturn = 0;
+float GasDelivered = 0;
 float Irms[3], Volts[3], IrmsCT[3];                                             // float is 32 bits; current in A
 int16_t MainsMeterIrms[3];                                                      // current in dA (10 * A) !!!
 bool lockedToP1 = false;
@@ -104,6 +111,8 @@ unsigned char led = 0, Wire = WIRES4 + CW;
 uint16_t blinkram = 0, P1taskram = 0;
 extern bool LocalTimeSet;
 int phasesLastUpdate = 0;
+unsigned long PortalTimeout = 0;
+bool WiFiModbusCtrl = false;
 
 
 void SetLedSequence(uint8_t source) {
@@ -135,7 +144,7 @@ void SetLedSequence(uint8_t source) {
             // Blink 1x Orange when not using MAINS input
             LedSeq[0] = LED_ORANGE;                
         }
-    // LED_RED_ON (PIC chip not programmed?)
+    // LED_RED_ON (PIC chip not programmed, or communication with P1 lost)
     } else {
         LedSeq[0] = LED_RED;
     }
@@ -167,9 +176,35 @@ void Timer2S(void * parameter) {
             MQTTclient.publish(MQTTprefix + "/MainsCurrentL2", MainsMeterIrms[1], false, 0);
             MQTTclient.publish(MQTTprefix + "/MainsCurrentL3", MainsMeterIrms[2], false, 0);
             if (lockedToP1) { //we don't have volts from CT
-                for (uint8_t i = 0; i < 3; i++)
+                for (uint8_t i = 0; i < 3; i++) {
                     MQTTclient.publish((String(MQTTprefix) + "/MainsVoltageL" + (i + 1)).c_str(), String(Volts[i], 1).c_str(), false, 0);
-            }
+                }
+                for (uint8_t i = 0; i < 3; i++) {    
+                    MQTTclient.publish((String(MQTTprefix) + "/PowerDeliveredL" + (i + 1)).c_str(), Power[i], false, 0);        // Watt
+                }
+                for (uint8_t i = 0; i < 3; i++) {    
+                    MQTTclient.publish((String(MQTTprefix) + "/PowerReturnedL" + (i + 1)).c_str(), PowerReturn[i], false, 0);   // Watt
+                }
+                for (uint8_t i = 0; i < 3; i++) {        
+                    MQTTclient.publish((String(MQTTprefix) + "/CTCurrentL" + (i + 1)).c_str(), round(IrmsCT[i] * 10), false, 0); // dA
+                }
+
+                MQTTclient.publish(MQTTprefix + "/PowerDelivered", TotalPower, false, 0);         // Watt
+                MQTTclient.publish(MQTTprefix + "/PowerReturned", TotalPowerReturn, false, 0);    // Watt
+                   
+                MQTTclient.publish(MQTTprefix + "/EnergyDeliveredTariff1", String(EnergyTariff1, 3), false, 0);  // kWh
+                MQTTclient.publish(MQTTprefix + "/EnergyDeliveredTariff2", String(EnergyTariff2, 3), false, 0);  // kWh
+
+                MQTTclient.publish(MQTTprefix + "/EnergyReturnedTariff1", String(EnergyReturnTariff1, 3), false, 0);  // kWh
+                MQTTclient.publish(MQTTprefix + "/EnergyReturnedTariff2", String(EnergyReturnTariff2, 3), false, 0);  // kWh
+
+                if (GasDelivered > 0) MQTTclient.publish(MQTTprefix + "/GasDelivered", String(GasDelivered, 3), false, 0);   // m3
+
+            } 
+            
+            MQTTclient.publish(MQTTprefix + "/ESPUptime", esp_timer_get_time() / 1000000, false, 0);
+            MQTTclient.publish(MQTTprefix + "/WiFiRSSI", String(WiFi.RSSI()), false, 0);
+ 
     #endif
             if (SmartEVSEHost != "") {                                              // we have a configured wifi host
                 if (SmartEVSEHost.substring(0,4) == "http") {                       // not MQTT, but http[s]
@@ -197,15 +232,51 @@ void Timer2S(void * parameter) {
                     FREE(currents);
     #endif
                 }
-                SetLedSequence(datareadyAPI);
             }
-          }
-
-          datareadyAPI = 0;
+          } else datareadyAPI = 0;  // When locked to P1 and no data, the led blinks RED
+        } // Wifi connected
+        
+        // Only set LED sequence from API if Modbus hasn't been active recently
+        if (millis() - ModbusLedTimer > MODBUS_LED_TIMEOUT) {
+            SetLedSequence(datareadyAPI);
         }
+        datareadyAPI = 0;
+
         vTaskDelay(2000 / portTICK_PERIOD_MS);
     }
 }
+
+String readMqttCaCert() {
+    if (!LittleFS.exists("/mqtt_ca.pem")) {
+        _LOG_A("No /mqtt_ca.pem found.\n");
+        return "";
+    }
+    File file = LittleFS.open("/mqtt_ca.pem", "r");
+    if (!file) {
+        _LOG_A("Failed to open /mqtt_ca.pem for reading.\n");
+        return "";
+    }
+    String cert = file.readString();
+    file.close();
+    return cert;
+}
+
+void writeMqttCaCert(const String& cert) {
+    if (cert.isEmpty()) {
+        LittleFS.remove("/mqtt_ca.pem");
+        _LOG_D("Removed /mqtt_ca.pem.\n");
+        return;
+    }
+    File file = LittleFS.open("/mqtt_ca.pem", "w");
+    if (!file) {
+        _LOG_A("Failed to open /mqtt_ca.pem for writing.\n");
+        return;
+    }
+    file.print(cert);
+    file.close();
+    _LOG_D("Wrote %d bytes to /mqtt_ca.pem.\n", cert.length());
+}
+
 
 // ------------------------------------------------ Settings -----------------------------------------------------
 // 
@@ -218,6 +289,7 @@ void write_settings(void) {
 
   if (preferences.begin("settings", false) ) {
 
+    preferences.putUChar("Wire", Wire);
     preferences.putUChar("WIFImode", WIFImode);
     preferences.end();
 
@@ -229,6 +301,8 @@ void write_settings(void) {
 
 void read_settings(bool write) {    
   if (preferences.begin("settings", false) == true) {
+    
+    Wire = preferences.getUChar("Wire", WIRES4);
     WIFImode = preferences.getUChar("WIFImode", WIFI_MODE);
     SmartEVSEHost = preferences.getString("SmartEVSEHost", "");
     preferences.end();       
@@ -378,10 +452,7 @@ void CTReceive() {
 void P1Extract() {
 
   char *ret;
-  float L1Power = 0, L2Power = 0, L3Power = 0;
-  float L1PowerReturn = 0, L2PowerReturn = 0, L3PowerReturn = 0;
   bool fluvius = false;
-  float TotalPower, TotalPowerReturn;
 
   DSMRver = 0;
 
@@ -405,39 +476,56 @@ void P1Extract() {
   // Power received from Grid (Watt*1)
   ret = strstr((const char *)P1data,(const char *)":21.7.0");                 // Phase 1
   if (ret != NULL) {
-      L1Power = atof((const char *)ret+8)*1000;
+      Power[0] = atof((const char *)ret+8)*1000;
       if (DSMRver == 0) DSMRver = 50;                                         // Sagemcom T211-D does not send DSMR version
   }                                                                           // but it does send Power and Volts per phase.        
   ret = strstr((const char *)P1data,(const char *)":41.7.0");                 // Phase 2
-  if (ret != NULL) L2Power = atof((const char *)ret+8)*1000;
+  if (ret != NULL) Power[1] = atof((const char *)ret+8)*1000;
   ret = strstr((const char *)P1data,(const char *)":61.7.0");                 // Phase 3
-  if (ret != NULL) L3Power = atof((const char *)ret+8)*1000;
+  if (ret != NULL) Power[2] = atof((const char *)ret+8)*1000;
   
   // Power delivered to Grid (Watt*1)
   ret = strstr((const char *)P1data,(const char *)":22.7.0");                 
-  if (ret != NULL) L1PowerReturn = atof((const char *)ret+8)*1000;
+  if (ret != NULL) PowerReturn[0] = atof((const char *)ret+8)*1000;
   ret = strstr((const char *)P1data,(const char *)":42.7.0");
-  if (ret != NULL) L2PowerReturn = atof((const char *)ret+8)*1000;
+  if (ret != NULL) PowerReturn[1] = atof((const char *)ret+8)*1000;
   ret = strstr((const char *)P1data,(const char *)":62.7.0");
-  if (ret != NULL) L3PowerReturn = atof((const char *)ret+8)*1000;
-
+  if (ret != NULL) PowerReturn[2] = atof((const char *)ret+8)*1000;
   ret = strstr((const char *)P1data,(const char *)":1.7.0");                  // Total Power from Grid
-  TotalPower = atof((const char *)ret+7)*1000;
+  if (ret != NULL) TotalPower = atof((const char *)ret+7)*1000;
   ret = strstr((const char *)P1data,(const char *)":2.7.0");                  // Total Power delivered to Grid (Watt)
-  TotalPowerReturn = atof((const char *)ret+7)*1000;
+  if (ret != NULL) TotalPowerReturn = atof((const char *)ret+7)*1000;
+
+  // Total Energy
+  ret = strstr((const char *)P1data,(const char *)":1.8.1");                  // Energy delivered tariff 1 (kWh)
+  if (ret != NULL) EnergyTariff1 = atof((const char *)ret+7);
+  ret = strstr((const char *)P1data,(const char *)":1.8.2");                  // Energy delivered tariff 2
+  if (ret != NULL) EnergyTariff2 = atof((const char *)ret+7);
+  ret = strstr((const char *)P1data,(const char *)":2.8.1");                  // Energy returned tariff 1
+  if (ret != NULL) EnergyReturnTariff1 = atof((const char *)ret+7);
+  ret = strstr((const char *)P1data,(const char *)":2.8.2");                  // Energy returned tariff 2
+  if (ret != NULL) EnergyReturnTariff2 = atof((const char *)ret+7);
+
+  // Gas meter 
+  // 0-1:24.2.1(210809124005S)(06415.108*m3)
+  // 0-1:24.2.3(210204163500W)(00343.925*m3)
+  ret = strstr((const char *)P1data,(const char *)":24.2.1");
+  if (ret != NULL) GasDelivered = atof((const char *)ret+23);
+  ret = strstr((const char *)P1data,(const char *)":24.2.3");
+  if (ret != NULL) GasDelivered = atof((const char *)ret+23);
 
   // Fluvius meter, but no voltage on phase 2 and 3
   if (fluvius && DSMRver == 0 && Volts[1] == 1 && Volts[2] == 1) {
     // So it's a one phase meter without :21.7.0 data (some models of the Sagemcom S211)
     // we can use the Total power measurements instead.
-    L1Power = TotalPower;
-    L1PowerReturn = TotalPowerReturn;
+    Power[0] = TotalPower;
+    PowerReturn[0] = TotalPowerReturn;
     DSMRver = 50;
   }
 
-  Irms[0] = (L1Power-L1PowerReturn)/Volts[0];                              		// Irms (Amps *1)
-  Irms[1] = (L2Power-L2PowerReturn)/Volts[1];
-  Irms[2] = (L3Power-L3PowerReturn)/Volts[2];
+  Irms[0] = (Power[0]-PowerReturn[0])/Volts[0];                              	// Irms (Amps *1)
+  Irms[1] = (Power[1]-PowerReturn[1])/Volts[1];
+  Irms[2] = (Power[2]-PowerReturn[2])/Volts[2];
   
   phasesLastUpdate = time(NULL);
 
@@ -514,8 +602,6 @@ void P1Receive() {
   }
 }
 
-bool blockP1 = false;
-bool blockCT = false;
 
 // ----------------------------------------------------------------------------------------------------------------
 // Task that handles incoming P1 and CT data
@@ -525,36 +611,37 @@ void P1Task(void * parameter) {
   while(1) {
   
     // Check if there is new P1 data.
-    if (!blockP1) P1Receive();
+    P1Receive();
     if (!heap_caps_check_integrity_all(true)) {
         _LOG_A("\nheap error after P1 receive\n");
     }
 
     // Check if there is a new measurement from the PIC (CT measurements)
-    if (!blockCT) CTReceive();
+    CTReceive();
     if (!heap_caps_check_integrity_all(true)) {
         _LOG_A("\nheap error after CT receive\n");
     }
 
-    if (WiFi.status() != WL_CONNECTED && esp_timer_get_time() / 1000000 > 5 && WIFImode != 2 && esp_timer_get_time() / 1000000 < 180) {
+    // start wifi portal at powerup
+    if (WiFi.status() != WL_CONNECTED && esp_timer_get_time() / 1000000 > 5 && WIFImode != 2 && esp_timer_get_time() / 1000000 < PORTAL_TIMEOUT && WiFiModbusCtrl == false) {
         // if we have no wifi
         // and we are not in the first 5 seconds of startup (to give the existing wifi time to connect and P1 data to be entered)
         // and we are not already in wifimode 2
         // and we are not later then the first 180s after startup; perhaps we are not interested in having a wifi connection?
+        // and not overruled by modbus control
         // we go to wifimode 2
+        _LOG_A("Starting WiFi portal mode\n");
         WIFImode = 2;
-        if (lockedToP1) {
-            handleWIFImode();                                                   // P1 data comes in so Serial0 is available
-            blockCT = true;
-        } else {
-            handleWIFImode();
-            blockP1 = true;
-        }
+        PortalTimeout = millis();
+        handleWIFImode();
     }
 
-    if (WIFImode != 2) {
-        blockCT = false;
-        blockP1 = false;
+    // Auto-exit portal mode after timeout
+    if (WIFImode == 2 && (millis() > (PortalTimeout + (PORTAL_TIMEOUT * 1000)) ) ) {
+        _LOG_A("Portal timeout, stop WiFi...\n");
+        WIFImode = 0;
+        write_settings();
+        handleWIFImode();
     }
 
     // keep track of available stack ram
@@ -635,13 +722,19 @@ ModbusMessage MBReadFC04(ModbusMessage request) {
   // Prepare start of response
   response.add(request.getServerID(), request.getFunctionCode(), (uint8_t)(words * 2));
 
+  // We have valid data. Does not allow switching from P1 back to CT data !
+  // A broken P1 connection now creates a comm error instead of (invalid) CT measurements being used.
+  if (!((lockedToP1 == true && dataready & 0x80) || (lockedToP1 == false && dataready & 0x03))) {
+      dataready = 0;          // Set to 0 to indicate broken P1 connection
+  }
   SetLedSequence(dataready);
+  ModbusLedTimer = millis();  // Update Modbus LED timer to claim LED control
   
   // Set Modbus Sensorbox version 2.0 (20) + Wire settings.
   // Set Software version in MSB
   ModbusData[0] = (SENSORBOX_SWVER << 8) + SENSORBOX_VERSION + Wire;
   // Set DSMR version + dataready
-  ModbusData[1] = (uint16_t)(DSMRver<<8) + dataready;
+  ModbusData[1] = (uint16_t)(DSMRver<<8) + (dataready & 0xC3);
 
   n = 2;
   // Volts P1
@@ -677,10 +770,10 @@ ModbusMessage MBReadFC04(ModbusMessage request) {
   ModbusData[n++] = (uint16_t) (localIp[2] << 8) + localIp[3];
   ModbusData[n++] = (uint16_t) (MacId() >> 16);
   ModbusData[n++] = (uint16_t) (MacId() & 0xFFFF);
-  ModbusData[n++] = 0x0; //(uint16_t) (APpassword[7]<<8) + APpassword[6];
-  ModbusData[n++] = 0x0; //(uint16_t) (APpassword[5]<<8) + APpassword[4];
-  ModbusData[n++] = 0x0; //(uint16_t) (APpassword[3]<<8) + APpassword[2];
-  ModbusData[n++] = 0x0; //(uint16_t) (APpassword[1]<<8) + APpassword[0];
+  ModbusData[n++] = 0x3837; // '8' << 8 | '7'
+  ModbusData[n++] = 0x3635; // '6' << 8 | '5'
+  ModbusData[n++] = 0x3433; // '4' << 8 | '3'
+  ModbusData[n++] = 0x3231; // '2' << 8 | '1'
 
   dataready = 0;                                                                // reset dataready and DSMRversion
   DSMRver = 0;
@@ -726,6 +819,8 @@ ModbusMessage MBWriteFC06(ModbusMessage request) {
   } else if (addr == 0x801) {
     // Set WiFimode
     WIFImode = value & 3u;
+    if (WIFImode == 2) PortalTimeout = millis();
+    WiFiModbusCtrl = true;
     handleWIFImode();
     write_settings();
     return ECHO_RESPONSE;  
@@ -796,17 +891,18 @@ void setup() {
   // Check if the PIC needs updating..
   if (Pic18ReadConfigs() == 0x6980) {
     _LOG_A("PIC18F26K40 found\n");
+    size_t fs_size = 0;
+    const uint8_t *fs_data = (const uint8_t *)mg_unpack("/data/PIC18F26K40.hex", &fs_size, NULL);
 
-    if (SPIFFS.exists(PICfirmware))  {
-      _LOG_A("%s found on SPIFFS\n", PICfirmware);
-      file = SPIFFS.open(PICfirmware, "r");
-      if (!file) {
-        _LOG_A("file open failed\n");
-      } else {
-        ProgramPIC(file);                                                         // Program PIC
-        file.close();                                                             // close file after use
-        SPIFFS.remove(PICfirmware);                                               // erase hexfile, so we only program once
-      }
+    if (fs_data) {
+        _LOG_A("PIC18F26K40.hex found in packed FS\n");
+        if (preferences.begin("settings", false)) {
+            if (preferences.getUInt("picSWVersion", 0) != SENSORBOX_SWVER) {
+                ProgramPIC(fs_data, fs_size);
+                preferences.putUInt("picSWVersion", SENSORBOX_SWVER);
+            } else _LOG_A("firmware already up to date\n");
+            preferences.end();
+        }
     } else {
         _LOG_A("%s -not- found on SPIFFS\n", PICfirmware);
     }
@@ -815,16 +911,15 @@ void setup() {
     _LOG_A("PIC16F1704/5 found\n");
     PICfirmware = "/PIC16F1704.hex";
     
-    if (SPIFFS.exists(PICfirmware))  {
-      _LOG_A("%s found on SPIFFS\n", PICfirmware);
-      file = SPIFFS.open(PICfirmware, "r");
-      if (!file) {
-        _LOG_A("file open failed\n");
-      } else {
-        ProgramPIC16F(file);                                                      // Program PIC
-        file.close();                                                             // close file after use
-        SPIFFS.remove(PICfirmware);                                               // erase hexfile, so we only program once
-      }
+    if (fs_data) {
+        _LOG_A("PIC16F1704.hex found in packed FS\n");
+        if (preferences.begin("settings", false)) {
+            if (preferences.getUInt("picSWVersion", 0) != SENSORBOX_SWVER) {
+                ProgramPIC16F(fs_data, fs_size);
+                preferences.putUInt("picSWVersion", SENSORBOX_SWVER);
+            } else _LOG_A("firmware already up to date\n");
+            preferences.end();
+        }
     } else {
         _LOG_A("%s -not- found on SPIFFS\n", PICfirmware);
     }
@@ -840,7 +935,10 @@ void setup() {
   // store default values if uninitialized
   read_settings(true);
 
-  
+  if(!LittleFS.begin(true)) {
+        _LOG_A("LittleFS Mount Failed\n");
+  }
+ 
   
   // Setup Modbus Server/Node
   // Set eModbus LogLevel to 1, to suppress possible E5 errors
@@ -896,7 +994,7 @@ void setup() {
 #if MQTT
 void mqtt_receive_callback(const String topic, const String payload) {
     // Make sure MQTT updates directly to prevent debounces
-    lastMqttUpdate = 10;
+    lastMqttUpdate = 10;    // TODO unused
 }
 
 
@@ -905,62 +1003,52 @@ void SetupMQTTClient() {
     MQTTclient.subscribe(MQTTprefix + "/Set/#",1);
     MQTTclient.publish(MQTTprefix+"/connected", "online", true, 0);
 
-    //publish MQTT discovery topics
-    //we need something to make all this JSON stuff readable, without doing all this assign and serialize stuff
-#define jsn(x, y) String(R"(")") + x + R"(" : ")" + y + R"(")"
-    //jsn(device_class, current) expands to:
-    // R"("device_class" : "current")"
-
-#define jsna(x, y) String(R"(, )") + jsn(x, y)
-    //json add expansion, same as above but now with a comma prepended
-
-    //first all device stuff:
-    const String device_payload = String(R"("device": {)") + jsn("model","SmartEVSE v3") + jsna("identifiers", MQTTprefix) + jsna("name", MQTTprefix) + jsna("manufacturer","Stegen") + jsna("configuration_url", "http://" + WiFi.localIP().toString().c_str()) + jsna("sw_version", String(VERSION)) + "}";
-    //a device SmartEVSE-1001 consists of multiple entities, and an entity can be in the domains sensor, number, select etc.
-    String entity_suffix, entity_name, optional_payload;
-
-    //some self-updating variables here:
-#define entity_id String(MQTTprefix + "-" + entity_suffix)
-#define entity_path String(MQTTprefix + "/" + entity_suffix)
-#define entity_name(x) entity_name = x; entity_suffix = entity_name; entity_suffix.replace(" ", "");
-
-    //create template to announce an entity in it's own domain:
-#define announce(x, entity_domain) entity_name(x); \
-    MQTTclient.publish("homeassistant/" + String(entity_domain) + "/" + entity_id + "/config", \
-     "{" \
-        + jsn("name", entity_name) \
-        + jsna("object_id", entity_id) \
-        + jsna("unique_id", entity_id) \
-        + jsna("state_topic", entity_path) \
-        + jsna("availability_topic",String(MQTTprefix+"/connected")) \
-        + ", " + device_payload + optional_payload \
-        + "}", \
-    true, 0); // Retain + QoS 0
-
     //set the parameters for and announce sensors with device class 'current':
-    optional_payload = jsna("device_class","current") + jsna("unit_of_measurement","A") + jsna("value_template", R"({{ value | int / 10 }})");
-//    if (MainsMeter.Type) {
-        announce("Mains Current L1", "sensor");
-        announce("Mains Current L2", "sensor");
-        announce("Mains Current L3", "sensor");
-//    }
+    String optional_payload = MQTTclient.jsna("device_class","current") + MQTTclient.jsna("state_class","measurement") + MQTTclient.jsna("unit_of_measurement","A") + MQTTclient.jsna("value_template", R"({{ value | int / 10 }})");
+    MQTTclient.announce("Mains Current L1", "sensor", optional_payload);
+    MQTTclient.announce("Mains Current L2", "sensor", optional_payload);
+    MQTTclient.announce("Mains Current L3", "sensor", optional_payload);
+    MQTTclient.announce("CT Current L1", "sensor", optional_payload);
+    MQTTclient.announce("CT Current L2", "sensor", optional_payload);
+    MQTTclient.announce("CT Current L3", "sensor", optional_payload);
 
     if (lockedToP1) { //we don't have volts from CT
-        //optional_payload = jsna("device_class","voltage") + jsna("unit_of_measurement","V") + jsna("value_template", R"({{ value | int / 10 }})");
-        optional_payload = jsna("device_class","voltage") + jsna("unit_of_measurement","V") + jsna("value_template", R"({{ value | float | round(1) }})");
-        announce("Mains Voltage L1", "sensor");
-        announce("Mains Voltage L2", "sensor");
-        announce("Mains Voltage L3", "sensor");
+        optional_payload = MQTTclient.jsna("device_class","voltage") + MQTTclient.jsna("state_class","measurement") + MQTTclient.jsna("unit_of_measurement","V") + MQTTclient.jsna("value_template", R"({{ value | float | round(1) }})");
+        MQTTclient.announce("Mains Voltage L1", "sensor", optional_payload);
+        MQTTclient.announce("Mains Voltage L2", "sensor", optional_payload);
+        MQTTclient.announce("Mains Voltage L3", "sensor", optional_payload);
+
+        // Power sensors (Watt)
+        optional_payload = MQTTclient.jsna("device_class","power") + MQTTclient.jsna("state_class","measurement") + MQTTclient.jsna("unit_of_measurement","W");
+        MQTTclient.announce("Power Delivered L1", "sensor", optional_payload);
+        MQTTclient.announce("Power Delivered L2", "sensor", optional_payload);
+        MQTTclient.announce("Power Delivered L3", "sensor", optional_payload);
+        MQTTclient.announce("Power Returned L1", "sensor", optional_payload);
+        MQTTclient.announce("Power Returned L2", "sensor", optional_payload);
+        MQTTclient.announce("Power Returned L3", "sensor", optional_payload);
+        MQTTclient.announce("Power Delivered", "sensor", optional_payload);
+        MQTTclient.announce("Power Returned", "sensor", optional_payload);
+
+        // Energy sensors (kWh)
+        optional_payload = MQTTclient.jsna("device_class","energy") + MQTTclient.jsna("state_class","total_increasing") + MQTTclient.jsna("unit_of_measurement","kWh");
+        MQTTclient.announce("Energy Delivered Tariff1", "sensor", optional_payload);
+        MQTTclient.announce("Energy Delivered Tariff2", "sensor", optional_payload);
+        MQTTclient.announce("Energy Returned Tariff1", "sensor", optional_payload);
+        MQTTclient.announce("Energy Returned Tariff2", "sensor", optional_payload);
+
+        // Gas sensor (m³)
+        optional_payload = MQTTclient.jsna("device_class","gas") + MQTTclient.jsna("state_class","total_increasing") + MQTTclient.jsna("unit_of_measurement","m³");
+        MQTTclient.announce("Gas Delivered", "sensor", optional_payload);
     }
 
     //set the parameters for and announce diagnostic sensor entities:
-    optional_payload = jsna("entity_category","diagnostic");
-    announce("WiFi SSID", "sensor");
-    announce("WiFi BSSID", "sensor");
-    optional_payload = jsna("entity_category","diagnostic") + jsna("device_class","signal_strength") + jsna("unit_of_measurement","dBm");
-    announce("WiFi RSSI", "sensor");
-    optional_payload = jsna("entity_category","diagnostic") + jsna("device_class","duration") + jsna("unit_of_measurement","s") + jsna("entity_registry_enabled_default","False");
-    announce("ESP Uptime", "sensor");
+    optional_payload = MQTTclient.jsna("entity_category","diagnostic");
+    MQTTclient.announce("WiFi SSID", "sensor", optional_payload);
+    MQTTclient.announce("WiFi BSSID", "sensor", optional_payload);
+    optional_payload = MQTTclient.jsna("entity_category","diagnostic") + MQTTclient.jsna("device_class","signal_strength") + MQTTclient.jsna("unit_of_measurement","dBm") + MQTTclient.jsna("state_class","measurement");
+    MQTTclient.announce("WiFi RSSI", "sensor", optional_payload);
+    optional_payload = MQTTclient.jsna("entity_category","diagnostic") + MQTTclient.jsna("device_class","duration") + MQTTclient.jsna("unit_of_measurement","s") + MQTTclient.jsna("state_class","measurement") + MQTTclient.jsna("entity_registry_enabled_default","False");
+    MQTTclient.announce("ESP Uptime", "sensor", optional_payload);
 
     MQTTclient.publish(MQTTprefix + "/WiFiSSID", String(WiFi.SSID()), true, 0);
     MQTTclient.publish(MQTTprefix + "/WiFiBSSID", String(WiFi.BSSIDstr()), true, 0);
@@ -1045,7 +1133,7 @@ bool handle_URI(struct mg_connection *c, struct mg_http_message *hm,  webServerR
             doc["mqtt"]["topic_prefix"] = MQTTprefix;
             doc["mqtt"]["username"] = MQTTuser;
             doc["mqtt"]["password_set"] = MQTTpassword != "";
-
+            doc["mqtt"]["tls"] = MQTTtls;
             if (MQTTclient.connected) {
                 doc["mqtt"]["status"] = "Connected";
             } else {
@@ -1112,9 +1200,11 @@ void loop() {
         // reset the WDT every second
         esp_task_wdt_reset();
 
+        static uint8_t RebootDelay = 5;      
         if (shouldReboot) {
-            delay(5000);                                                        //give user some time to read any message on the webserver
-            ESP.restart();
+            if (RebootDelay-- == 0) {                                           //give user some time to read any message on the webserver
+                ESP.restart();                                                  //use non-blocking code so network_loop() keeps working.
+            }
         }
         //_LOG_A("Status: %04x Time: %02u:%02u Date: %02u/%02u/%02u Day:%u ", WIFImode + (LocalTimeSet << 8), timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_mday, timeinfo.tm_mon+1, timeinfo.tm_year%100, timeinfo.tm_wday);
         //_LOG_A("Connected to AP: %s Local IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
