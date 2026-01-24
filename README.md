@@ -1,25 +1,78 @@
 # Sensorbox-2
-Sensorbox2 measures the current(A) and current direction for up to three phases with CT's and a MAINS voltage input.
-It can also receive these measurements directly from a (D)SMR5 smart meters P1 port.
-These measurements are then sent every two seconds to the connected SmartEVSE(s).
+Sensorbox-2 measures the current (A) for up to three phases with CTs and a MAINS voltage input.
+It can also receive these measurements directly from a DSMR 5.x smart meter's P1 port.
+These measurements are then sent every two seconds to SmartEVSE controllers, either wired over RS485, or over WiFi.
 
-The Sensorbox2 uses a PIC microcontroller which does the CT measurements and sends this information to the ESP32.
-The ESP32 processes the P1 port (Smart Meter connection) data and RS485 communication to the SmartESVE.
-The PIC will be (re)programmed by the ESP32 module. At powerup the ESP32 looks for a PIC18F26K40.hex file in the /data folder and, when found programs the PIC18F26K40 microcontroller.
+**Installation Location:**
+The Sensorbox-2 should be installed inside your electrical cabinet, positioned next to the MAINS meter. This location is essential to:
+- **Connect Current Transformers (CTs)**: Position the Sensorbox near where CT connections can be made to your electrical phases.
+- **Connect to Smart Meter**: If your Smart Meter has a DSMR 5.x P1 port, install the Sensorbox nearby and connect via the supplied P1 cable, allowing direct data extraction from the meter.
 
-# Upgrading firmware
+The Sensorbox's wired RS485 connection to SmartEVSE can be extended up to 100 meters if needed. A wired connection is preferred for reliable charging.<br>
+Wireless connectivity to the SmartEVSE is also possible, but requires a stable WiFi signal. WiFi instability may cause communication errors that could affect charging. Use WiFi if a stable connection can be guaranteed, and a wired connection is not feasable.
 
-Versions 2.1.0 and higher have wifi, webserver and MQTT active on your Sensorbox-2; it all works similarly to the SmartEVSEv3. To upgrade from your old, non-wifi Sensorbox-2 firmware,
-upgrade your SmartEVSE firmware to version v3.7.2 or higher.
+The latest software v2.1.3 will send the following P1 meter data to a configurable MQTT server:
+- Voltage per Phase
+- Current per Phase
+- Power per Phase Delivered
+- Power per Phase Returned
+- Total Power Delivered
+- Total Power Returned
+- Energy Delivered Tariff 1
+- Energy Returned Tariff 1
+- Energy Delivered Tariff 2
+- Energy Returned Tariff 2
+- Gas meter
 
-Once your SmartEVSEv3 detects your Sensorbox-2's old firmware, it will present the LCD screen with a new option: SB2 WIFI, with default <Disabled>.
-Select <Setup>, the Sensorbox will presents itself as a Wifi Acces Point "smartevse-xxxx"; the password is shown on the LCD screen.
-Connect with your phone to that access point, go to http://192.168.4.1/ and configure your Wifi password.
+See [configuration](docs/configuration.md) for more on MQTT.
 
-THIS IS A ONE TIME OPERATION!
+## Connecting to WiFi (and updating firmware)
 
-After you updated your Sensorbox-2 to v2.1.0 or higher, this function will not work anymore, and it will not be shown in your SmartEVSEv3 menu.
-You are supposed to update your firmware through the /update page on the Sensorbox-2 webserver, or through the ESPtouch or USB procedure as described in the SmartEVSEv3 docs.
+To upgrade your Sensorbox-2 firmware, first make sure your SmartEVSE v3 firmware is v3.7.2 or higher.
+
+The Sensorbox should be wired to the SmartEVSE, using wires A, B, 12V and GND.
+Once your SmartEVSE v3 detects your Sensorbox, it will present the LCD screen with a new option: **SB2 WIFI**, which is set to `Disabled` by default.
+Select `SetupWiFi` here, and the Sensorbox will present itself as a WiFi Access Point "smartevse-xxxx" or "Sensorbox-xxxx"; the password is shown on the LCD screen.
+Connect with your phone to that access point, go to http://192.168.4.1/ and enter your local WiFi credentials.
+
+```
+Please note that if you don't see the 'SB2 WIFI' option it is possible you have a Sensorbox hardware version 1.0.6 with an even older firmware. 
+You can check the hardware version by removing the P1 cable from the sensorbox, and looking inside. The version is printed on the circuit board.
+In this case you will need to flash the firmware with a USB cable.
+```
+
+Once the Sensorbox is connected to your WiFi, you can find its IP address on the SmartEVSE's **SB2 WIFI** menu option.
+Browse to this IP address, and you will be presented with the Sensorbox2's WiFi status page.<br>
+
+If you want to upgrade your Sensorbox2's firmware, browse to http://ip-address/update where "ip-address" is the IP address of the Sensorbox.<br>
+Proceed by uploading the firmware.bin file.
+
+On firmware version 2.1.0 or newer the procedure to configure WiFi has changed:<br>
+See [configuration](docs/configuration.md)
+
+## Status LED
+
+The status LED sequence depends on the working mode of the Sensorbox:
+
+1 blink:
+- Green: P1 measurement. Orange: CT measurement (no direction of currents). Red: P1 Comm Error 
+
+2 blinks:
+- Green: P1 measurement. Orange: CT measurement (no direction of currents). Red: P1 Comm Error
+- Green: connected to WiFi. Red: Portal active, waiting to connect 
+
+3 blinks:
+1. Phase L1: Green = export, Orange = import
+2. Phase L2: Green = export, Orange = import
+3. Phase L3: Green = export, Orange = import
+
+4 blinks:
+1. Phase L1: Green = export, Orange = import
+2. Phase L2: Green = export, Orange = import
+3. Phase L3: Green = export, Orange = import
+4. Green: connected to WiFi, Red: Portal active, waiting to connect
+
+
 
 
 ## Modbus Registers
@@ -42,13 +95,13 @@ Input Registers (FC=04)(Read Only):
      0x0008      2       Amps L1 (32 bit floating point), Smartmeter P1 data
      0x000A      2       Amps L2 (32 bit floating point), Smartmeter P1 data
      0x000C      2       Amps L3 (32 bit floating point), Smartmeter P1 data
-     0x000E      2       Amps L1 (32 bit floating point), CT imput 1
+     0x000E      2       Amps L1 (32 bit floating point), CT input 1
      0x0010      2       Amps L2 (32 bit floating point), CT input 2
      0x0012      2       Amps L3 (32 bit floating point), CT input 3
      
      with sensorbox software version >= 0x01xx, the following extra registers are available
 
-     0x0014      1       WiFi Connection Status  xxxxxACL xxxxxxWW = WiFi mode (00=Wifi Off, 01=On, 10=portal started)
+     0x0014      1       WiFi Connection Status  xxxxxACL xxxxxxWW = WiFi mode (00=WiFi Off, 01=On, 10=portal started)
                                                       ||\_ Local Time Set
                                                       |\__ Connected to WiFi
                                                       \___ AP_STA mode (portal) active
