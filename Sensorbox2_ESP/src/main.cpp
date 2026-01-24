@@ -865,8 +865,9 @@ void setup() {
   
   // Green status LED = firmware 2.1.0
   // Firmware 2.0.x powered on with an Orange status LED
-  digitalWrite(PIN_LED_GREEN, LOW);                                             // LED Green ON;
-  digitalWrite(PIN_LED_RED, HIGH);                                              // LED Red OFF;
+  // Firmware 2.1.3 Red status LED
+  digitalWrite(PIN_LED_GREEN, HIGH);                                            // LED Green OFF;
+  digitalWrite(PIN_LED_RED, LOW);                                               // LED Red ON;
   delay(500);
 
   // Setup Serial ports
