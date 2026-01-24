@@ -3,7 +3,6 @@
 #include "main.h"
 #include "network_common.h"
 #include "utils.h"
-#include "FS.h"
 
 #define SWAP16(x) (((x & 0x00ff) << 8) | ((x & 0xff00) >> 8))
 
@@ -209,7 +208,7 @@ uint16_t Pic18ReadConfigs() {
   return DeviceID;
 }
 
-uint8_t ProgramPIC(File file) {
+uint8_t ProgramPIC(const uint8_t *data, size_t size) {
 
   uint32_t filepointer=0;
   uint8_t n, p, checksum, bytecount, recordtype, startoffset;
@@ -217,7 +216,7 @@ uint8_t ProgramPIC(File file) {
   char filebuffer[90];                                                          // holds one row of the hex file
   char programbuffer[WRITE_LATCHES];                                            // block of flash data for the PIC
 
-  _LOG_A("filesize %u bytes\n", file.size());
+  _LOG_A("filesize %u bytes\n", size);
 
   EnterLVPmode();
   CmdLoadPCAddress(ADR_CONFIG);         // Program Flash Memory
@@ -228,9 +227,12 @@ uint8_t ProgramPIC(File file) {
 
   memset(programbuffer, 0xff, sizeof(programbuffer));                           // clear programbuffer
 
-  while (1) {                                                                   // loop till end of file
-    file.seek(filepointer);
-    file.readBytes(filebuffer,89);
+  while (filepointer < size) {                                                                   // loop till end of file
+    // file.seek(filepointer);
+    // file.readBytes(filebuffer,89);
+    size_t len = (size - filepointer) > 89 ? 89 : (size - filepointer);
+    memcpy(filebuffer, data + filepointer, len);
+    if (len < 89) filebuffer[len] = 0; // null terminate if last chunk
 
     n = 0;
     while ((filebuffer[n++]!=':') && (n<90)) { }                                  // find the startcode ':' in buffer
@@ -347,6 +349,7 @@ uint8_t ProgramPIC(File file) {
 
   } // while loop
 
+  return 0;
 }
 
 //************************** PIC16F functions *****************************
@@ -553,7 +556,7 @@ void Store16F(uint32_t address, uint16_t data) {
 //
 //
 //
-void ProgramPIC16F(File file) {
+uint8_t ProgramPIC16F(const uint8_t *data, size_t size) {
 
     EnterLVPmode16F();
     CmdLoadConfig16F(0x00);
@@ -562,16 +565,34 @@ void ProgramPIC16F(File file) {
 
     // CODE
     uint32_t address = 0;
-    _LOG_A("filesize %u bytes\n", file.size());
+    _LOG_A("filesize %u bytes\n", size);
     
-//    webSocket.sendTXT(num, "pFlashing...");
     uint16_t offset = 0;
-    while(file.available()) {
+    uint32_t filepointer = 0;
+
+    while(filepointer < size) {
       uint8_t d_len;
       uint16_t d_addr;
       uint8_t d_typ;
-      String s = file.readStringUntil('\n');
+      
+      // Find end of line
+      uint32_t line_end = filepointer;
+      while (line_end < size && data[line_end] != '\n' && data[line_end] != '\r') line_end++;
+      
+      if (line_end == filepointer) { // skip empty lines
+        filepointer++;
+        continue;
+      }
+
+      String s = "";
+      for (uint32_t i=filepointer; i<line_end; i++) s += (char)data[i];
+
+      // move filepointer past CRLF
+      filepointer = line_end;
+      while (filepointer < size && (data[filepointer] == '\n' || data[filepointer] == '\r')) filepointer++;
+
       //_LOG_A("%s\n,", s);
+      if (s.length() < 9) continue; 
       d_len=HexDec2(s[1],s[2]);
       d_addr=HexDec4(s[3],s[4],s[5],s[6]);
       d_typ=HexDec2(s[7],s[8]);
@@ -601,12 +622,8 @@ void ProgramPIC16F(File file) {
     }
     _LOG_A("\nProgramming done.\n");
 
-//    f.close();
-//    char tmps[20];
-//    sprintf(tmps,"pTotal %d bytes flashed",cnt);
-//    webSocket.sendTXT(num, tmps);
-
     CmdResetAddress16F();
     ExitLVPmode();
+    return 0;
 }
  

@@ -1,8 +1,4 @@
 /*
-;  Use
-;  pio run -t uploadfs
-;  to upload the SPIFFS files in the /data folder to flash
-;
 ;   Modbus RTU slave address is fixed to 0x0A, speed is 9600 bps 
 :   
 ;   Input Registers (FC=04)(Read Only):
@@ -70,6 +66,8 @@
 #include <SPI.h>
 #include <HTTPClient.h>
 
+extern "C" const char *mg_unpack(const char *name, size_t *size, time_t *mtime);
+
 extern struct tm timeinfo;
 
 //String APhostname = "SmartEVSE-" + String( MacId() & 0xffff, 10);           // SmartEVSE access point Name = SmartEVSE-xxxxx
@@ -84,9 +82,6 @@ ModbusServerRTU MBserver(2000, ToggleRS485);                        // TCP timeo
 Preferences preferences;
 
 uint16_t DeviceID, Revision, UserID0, FlashADR, FlashData ;
-File file;
-uint32_t filesize;
-const char* PICfirmware = "/PIC18F26K40.hex";
 
 uint8_t P1data[2000];
 uint16_t ModbusData[50];    // 50 registers
@@ -879,16 +874,6 @@ void setup() {
   while(!Serial); 
   _LOG_A("\nSensorbox 2 powerup\n");
 
-  // Initialize SPIFFS
-  if(!SPIFFS.begin(true)){
-    _LOG_A("SPIFFS failed! already tried formatting. HALT\n");
-    while (true) {
-      delay(1);
-    }
-  }
-  _LOG_A("Total SPIFFS bytes: %u, Bytes used: %u\n",SPIFFS.totalBytes(),SPIFFS.usedBytes());
-
-
   // Check if the PIC needs updating..
   if (Pic18ReadConfigs() == 0x6980) {
     _LOG_A("PIC18F26K40 found\n");
@@ -905,12 +890,13 @@ void setup() {
             preferences.end();
         }
     } else {
-        _LOG_A("%s -not- found on SPIFFS\n", PICfirmware);
+        _LOG_A("PIC18F26K40.hex -not- found\n");
     }
 
   } else if (Pic16ReadConfigs() == 0x3043 || Pic16ReadConfigs() == 0x3055) {
     _LOG_A("PIC16F1704/5 found\n");
-    PICfirmware = "/PIC16F1704.hex";
+    size_t fs_size = 0;
+    const uint8_t *fs_data = (const uint8_t *)mg_unpack("/data/PIC16F1704.hex", &fs_size, NULL);
     
     if (fs_data) {
         _LOG_A("PIC16F1704.hex found in packed FS\n");
@@ -922,7 +908,7 @@ void setup() {
             preferences.end();
         }
     } else {
-        _LOG_A("%s -not- found on SPIFFS\n", PICfirmware);
+        _LOG_A("PIC16F1704.hex -not- found\n");
     }
   } else {
       _LOG_A("No PIC found, Not possible to do CT measurements!\n");
